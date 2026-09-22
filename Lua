@@ -1,0 +1,604 @@
+-- ========================================================
+-- Universal Hub Pro v4 (Delta Mobile Friendly)
+-- Performance • Freecam • Theme Studio • Smart Server Hop
+-- ========================================================
+
+local Players           = game:GetService("Players")
+local CoreGui           = game:GetService("CoreGui")
+local UserInputService  = game:GetService("UserInputService")
+local TweenService      = game:GetService("TweenService")
+local RunService        = game:GetService("RunService")
+local Lighting          = game:GetService("Lighting")
+local Workspace         = game:GetService("Workspace")
+local TeleportService   = game:GetService("TeleportService")
+local HttpService       = game:GetService("HttpService")
+local VirtualUser       = game:GetService("VirtualUser")
+local StarterGui        = game:GetService("StarterGui")
+local GuiService        = game:GetService("GuiService")
+
+local LocalPlayer = Players.LocalPlayer
+local env = (getgenv and getgenv()) or _G
+
+local function cam() return Workspace.CurrentCamera end
+
+-- ที่วาง GUI
+local targetParent
+do
+    local ok, res = pcall(function() return gethui and gethui() end)
+    targetParent = (ok and res) or LocalPlayer:FindFirstChildOfClass("PlayerGui") or CoreGui
+end
+
+-- ล้างของเก่า (รันซ้ำได้ไม่ซ้อน)
+if env.MSH_Unload then pcall(env.MSH_Unload) end
+if targetParent:FindFirstChild("MinimalSpeedHubUI") then
+    targetParent.MinimalSpeedHubUI:Destroy()
+end
+
+-- ========================================================
+-- ตัวแปรหลัก
+-- ========================================================
+-- ที่เก็บ Connection ทั้งหมด ตัดทิ้งให้หมดตอน Unload
+local Conns = {}
+local function track(c) Conns[#Conns + 1] = c return c end
+
+local State = {
+    -- เคลื่อนที่
+    speed = false,   speedVal = 50,
+    jump = false,    jumpVal = 100,
+    infJump = false, noclip = false,
+    fly = false,     flySpeed = 60,
+    lowGrav = false, gravVal = 50,
+    bhop = false,    tapTP = false,
+    -- ตัวละคร
+    freeze = false,  spin = false, spinSpeed = 360,
+    antiVoid = false, antiRagdoll = false, antiSit = false,
+    -- มองเห็น
+    fullbright = false, noFog = false,
+    timeLock = false,   timeVal = 12,
+    fov = false,        fovVal = 110,
+    esp = false,        espDist = 1500, espFill = 0.65,
+    espTeamCheck = false, espTracers = false, espHealthBar = false,
+    xray = false,
+    zoom = false,       firstPerson = false,
+    freecam = false,    freecamSpeed = 80,
+    fpsOverlay = false, coordOverlay = false,
+    -- เครื่องมือ
+    antiAfk = false, autoReconnect = false,
+    autoClick = false, cps = 10,
+    fpsBoost = false,
+    fpsCap = false, fpsCapVal = 120,
+}
+
+local Setters = {}    -- key -> {set=function, isOn=function}
+local Inputs = {}     -- key -> {get=function, set=function}
+local Listeners = {}  -- key -> {function(v)}
+
+local function onToggleChanged(key, fn)
+    Listeners[key] = Listeners[key] or {}
+    table.insert(Listeners[key], fn)
+end
+
+local function offToggleChanged(key, fn)
+    local list = Listeners[key]
+    if not list then return end
+    for i = #list, 1, -1 do
+        if list[i] == fn then table.remove(list, i) end
+    end
+end
+
+local origWalk, origJumpPower, origJumpHeight, origUseJumpPower = 16, 50, 7.2, true
+local origFOV = cam().FieldOfView
+local origGravity = Workspace.Gravity
+local origClock = Lighting.ClockTime
+local origLighting = {
+    Brightness = Lighting.Brightness,
+    GlobalShadows = Lighting.GlobalShadows,
+    FogEnd = Lighting.FogEnd,
+    Ambient = Lighting.Ambient,
+    OutdoorAmbient = Lighting.OutdoorAmbient,
+}
+local origZoom = {min = LocalPlayer.CameraMinZoomDistance, max = LocalPlayer.CameraMaxZoomDistance}
+local BRIGHT_AMBIENT = Color3.fromRGB(178, 178, 178)
+
+local savedCF = nil
+local lastSafe = nil
+local spectating = nil
+local StatLabel, PlayerListFrame -- สร้างทีหลังใน UI
+
+local function getChar() return LocalPlayer.Character end
+local function getHum()
+    local c = getChar()
+    return c and c:FindFirstChildOfClass("Humanoid")
+end
+local function getRoot()
+    local c = getChar()
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function notify(msg)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {Title = "Hub Pro", Text = msg, Duration = 3})
+    end)
+end
+
+local function copyText(txt, label)
+    local fn = setclipboard or toclipboard
+    if fn then
+        pcall(fn, txt)
+        notify("คัดลอก " .. label .. " แล้ว")
+    else
+        notify("executor นี้ไม่รองรับการคัดลอก")
+    end
+end
+
+-- เขียนค่าก็ต่อเมื่อค่าต่างจากเดิม (ลดงานที่ไม่จำเป็นในลูป)
+local function setProp(obj, prop, val)
+    if obj[prop] ~= val then obj[prop] = val end
+end
+
+-- ========================================================
+-- ระบบไฟล์ / บันทึกการตั้งค่า
+-- ========================================================
+local canFile = type(writefile) == "function" and type(readfile) == "function" and type(isfile) == "function"
+local AUTOLOAD_FILE = "HubPro_autoload.txt"
+local THEME_FILE = "HubPro_theme.txt"
+local NO_SAVE = {freeze = true, autoLoad = true, freecam = true} -- ฟังก์ชันที่ไม่บันทึก
+local currentSlot = 1
+
+local function slotFile(n) return "HubPro_slot" .. n .. ".json" end
+local function wpFile() return "HubPro_wp_" .. tostring(game.PlaceId) .. ".json" end
+
+local function fileExists(name)
+    if not canFile then return false end
+    local ok, r = pcall(isfile, name)
+    return ok and r == true
+end
+
+local function collectConfig()
+    local cfg = {toggles = {}, values = {}}
+    for key, s in pairs(Setters) do
+        if s.isOn() and not NO_SAVE[key] then cfg.toggles[key] = true end
+    end
+    for key, i in pairs(Inputs) do
+        cfg.values[key] = i.get()
+    end
+    return cfg
+end
+
+local function applyConfig(cfg)
+    -- ตั้งค่าตัวเลขก่อน แล้วค่อยเปิด/ปิดสวิตช์
+    for key, val in pairs(cfg.values or {}) do
+        if Inputs[key] and tonumber(val) then Inputs[key].set(tonumber(val)) end
+    end
+    for key, s in pairs(Setters) do
+        if not NO_SAVE[key] then
+            local want = cfg.toggles ~= nil and cfg.toggles[key] == true
+            if s.isOn() ~= want then s.set(want) end
+        end
+    end
+end
+
+local function saveSlot(n)
+    if not canFile then notify("executor นี้ไม่รองรับการบันทึกไฟล์") return end
+    local ok = pcall(function()
+        writefile(slotFile(n), HttpService:JSONEncode(collectConfig()))
+    end)
+    notify(ok and ("บันทึกสล็อต " .. n .. " แล้ว") or "บันทึกไม่สำเร็จ")
+end
+
+local function loadSlot(n, silent)
+    if not canFile or not fileExists(slotFile(n)) then
+        if not silent then notify("สล็อต " .. n .. " ยังว่างอยู่") end
+        return
+    end
+    local ok, cfg = pcall(function()
+        return HttpService:JSONDecode(readfile(slotFile(n)))
+    end)
+    if ok and type(cfg) == "table" then
+        applyConfig(cfg)
+        if not silent then notify("โหลดสล็อต " .. n .. " แล้ว") end
+    else
+        notify("ไฟล์สล็อต " .. n .. " เสียหาย")
+    end
+end
+
+local function deleteSlot(n)
+    if canFile and type(delfile) == "function" and fileExists(slotFile(n)) then
+        pcall(delfile, slotFile(n))
+        notify("ลบสล็อต " .. n .. " แล้ว")
+    else
+        notify("สล็อต " .. n .. " ยังว่างอยู่")
+    end
+end
+
+-- จุดวาร์ป (เก็บแยกตามแมพ)
+local Waypoints = {}
+
+local function saveWaypoints()
+    if not canFile then return end
+    pcall(function() writefile(wpFile(), HttpService:JSONEncode(Waypoints)) end)
+end
+
+local function loadWaypoints()
+    if not fileExists(wpFile()) then return end
+    local ok, data = pcall(function() return HttpService:JSONDecode(readfile(wpFile())) end)
+    if ok and type(data) == "table" then
+        for _, w in ipairs(data) do
+            if type(w) == "table" and tonumber(w.x) and tonumber(w.y) and tonumber(w.z) then
+                Waypoints[#Waypoints + 1] = {name = tostring(w.name or "จุด"), x = w.x, y = w.y, z = w.z}
+            end
+        end
+    end
+end
+loadWaypoints()
+
+-- ========================================================
+-- สี / ธีม
+-- ========================================================
+local COL = {
+    bg      = Color3.fromRGB(15, 18, 15),
+    panel   = Color3.fromRGB(26, 31, 26),
+    field   = Color3.fromRGB(34, 41, 34),
+    accent  = Color3.fromRGB(0, 230, 118),
+    on      = Color3.fromRGB(46, 230, 120),   -- เขียวสว่างตอนเปิดใช้งาน
+    onText  = Color3.fromRGB(4, 28, 14),      -- ตัวอักษรเข้มบนพื้นสว่าง
+    text    = Color3.fromRGB(225, 242, 225),
+    dim     = Color3.fromRGB(175, 195, 175),
+    danger  = Color3.fromRGB(58, 26, 26),
+    dangerT = Color3.fromRGB(255, 120, 120),
+    friend  = Color3.fromRGB(80, 170, 255),
+}
+
+local Themed = {} -- ฟังก์ชันวาดสีใหม่เมื่อเปลี่ยนธีม
+local function themed(fn)
+    Themed[#Themed + 1] = fn
+    fn()
+end
+
+local function parseHex(s)
+    s = tostring(s or ""):gsub("#", ""):gsub("%s", "")
+    if #s == 6 and not s:find("%X") then
+        local c = Color3.fromRGB(tonumber(s:sub(1, 2), 16), tonumber(s:sub(3, 4), 16), tonumber(s:sub(5, 6), 16))
+        return c, string.upper(s)
+    end
+    return nil
+end
+
+local function setThemeColors(c)
+    COL.accent = c
+    COL.on = c:Lerp(Color3.new(1, 1, 1), 0.12)
+    local lum = c.R * 0.299 + c.G * 0.587 + c.B * 0.114
+    COL.onText = lum > 0.55 and Color3.fromRGB(8, 20, 12) or Color3.fromRGB(255, 255, 255)
+end
+
+-- โหลดธีมที่เคยเลือกไว้
+if fileExists(THEME_FILE) then
+    local ok, txt = pcall(readfile, THEME_FILE)
+    local c = ok and parseHex(txt) or nil
+    if c then setThemeColors(c) end
+end
+
+-- ========================================================
+-- ระบบฟังก์ชันต่าง ๆ
+-- ========================================================
+
+local function applyAntiRagdoll(v)
+    local hum = getHum()
+    if not hum then return end
+    pcall(function()
+        hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, not v)
+        hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, not v)
+    end)
+end
+
+-- เดินทะลุกำแพงแบบอิงเหตุการณ์ (ไม่ต้องไล่ GetDescendants ทุกเฟรม หรือสุ่มสแกนเป็นรอบ)
+-- เมื่อมีชิ้นส่วนใหม่โผล่ขึ้นมา (หยิบของ ใส่เสื้อผ้า โมเดลเปลี่ยน) จะจับได้ทันทีผ่าน DescendantAdded
+-- จึงไม่มีอาการติดกำแพงกะทันหันเหมือนระบบสแกนเป็นรอบ
+local noclipParts = {}      -- part -> true
+local noclipCharConn        -- connection ของตัวละครปัจจุบัน ตัดทิ้งเมื่อเกิดใหม่
+
+local function watchNoclipPart(p)
+    if p:IsA("BasePart") then
+        noclipParts[p] = true
+        if State.noclip and p.CanCollide then p.CanCollide = false end
+    end
+end
+
+local function rebuildNoclipWatch()
+    table.clear(noclipParts)
+    if noclipCharConn then noclipCharConn:Disconnect() end
+    local char = getChar()
+    if not char then return end
+    for _, p in ipairs(char:GetDescendants()) do watchNoclipPart(p) end
+    noclipCharConn = track(char.DescendantAdded:Connect(watchNoclipPart))
+end
+rebuildNoclipWatch()
+
+-- Stepped: วิ่ง / กระโดด / ทะลุ / บันนี่ฮอป / กันนั่ง / ตรึง
+track(RunService.Stepped:Connect(function()
+    local hum = getHum()
+    local root = getRoot()
+
+    if State.speed and hum and hum.WalkSpeed ~= State.speedVal then
+        hum.WalkSpeed = State.speedVal
+    end
+
+    if State.jump and hum then
+        if hum.UseJumpPower then
+            hum.JumpPower = State.jumpVal
+        else
+            hum.JumpHeight = (State.jumpVal ^ 2) / (2 * 196.2)
+        end
+    end
+
+    if State.bhop and hum and hum.MoveDirection.Magnitude > 0
+        and hum.FloorMaterial ~= Enum.Material.Air then
+        hum:ChangeState(Enum.HumanoidStateType.Jumping)
+    end
+
+    if State.antiSit and hum and hum.Sit then
+        hum.Sit = false
+    end
+
+    if State.noclip then
+        for p in pairs(noclipParts) do
+            if p.Parent and p.CanCollide then p.CanCollide = false end
+        end
+    end
+
+    if State.freeze and root and not root.Anchored then
+        root.Anchored = true
+    end
+end))
+
+-- กระโดดไม่จำกัด
+track(UserInputService.JumpRequest:Connect(function()
+    if State.infJump then
+        local hum = getHum()
+        if hum then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
+    end
+end))
+
+-- Anti-AFK
+track(LocalPlayer.Idled:Connect(function()
+    if State.antiAfk then
+        pcall(function()
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton2(Vector2.new())
+        end)
+    end
+end))
+
+-- เชื่อมต่อใหม่อัตโนมัติเมื่อหลุด
+track(GuiService.ErrorMessageChanged:Connect(function()
+    if State.autoReconnect then
+        task.wait(2)
+        pcall(function() TeleportService:Teleport(game.PlaceId, LocalPlayer) end)
+    end
+end))
+
+-- ระบบบิน
+local flyBV, flyBG
+local flyUp, flyDown = false, false
+local controls
+
+local function getMoveVector()
+    if not controls then
+        pcall(function()
+            local ps = LocalPlayer:FindFirstChild("PlayerScripts")
+            local pm = ps and ps:FindFirstChild("PlayerModule")
+            if pm then controls = require(pm):GetControls() end
+        end)
+    end
+    if controls then
+        local ok, v = pcall(function() return controls:GetMoveVector() end)
+        if ok and typeof(v) == "Vector3" then return v end
+    end
+    local hum = getHum()
+    if hum then return cam().CFrame:VectorToObjectSpace(hum.MoveDirection) end
+    return Vector3.zero
+end
+
+local function stopFly()
+    if flyBV then pcall(function() flyBV:Destroy() end) flyBV = nil end
+    if flyBG then pcall(function() flyBG:Destroy() end) flyBG = nil end
+    local hum = getHum()
+    if hum then hum.PlatformStand = false end
+end
+
+local function startFly()
+    local root, hum = getRoot(), getHum()
+    if not root or not hum then return end
+    stopFly()
+    flyBV = Instance.new("BodyVelocity")
+    flyBV.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+    flyBV.Velocity = Vector3.zero
+    flyBV.Parent = root
+    flyBG = Instance.new("BodyGyro")
+    flyBG.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
+    flyBG.P = 9e4
+    flyBG.CFrame = root.CFrame
+    flyBG.Parent = root
+    hum.PlatformStand = true
+end
+
+-- กล้องอิสระ (Freecam): กล้องบินไปรอบแมพ ตัวละครยืนอยู่ที่เดิม
+local fcPos, fcYaw, fcPitch = Vector3.zero, 0, 0
+local fcAnchoredBefore = false
+
+local function startFreecam()
+    local c = cam()
+    local cf = c.CFrame
+    fcPos = cf.Position
+    fcPitch, fcYaw = cf:ToOrientation()
+    c.CameraType = Enum.CameraType.Scriptable
+    local root = getRoot()
+    if root then
+        fcAnchoredBefore = root.Anchored
+        root.Anchored = true
+    end
+end
+
+local function stopFreecam()
+    local c = cam()
+    c.CameraType = Enum.CameraType.Custom
+    local hum = getHum()
+    if hum then c.CameraSubject = hum end
+    local root = getRoot()
+    if root then root.Anchored = fcAnchoredBefore or State.freeze end
+end
+
+-- หมุนกล้องอิสระด้วยการลากนิ้วบนจอ (หรือคลิกขวาค้างบน PC)
+track(UserInputService.InputChanged:Connect(function(input, gpe)
+    if not State.freecam or gpe then return end
+    local t = input.UserInputType
+    if t == Enum.UserInputType.Touch
+        or (t == Enum.UserInputType.MouseMovement
+            and UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)) then
+        fcYaw -= input.Delta.X * 0.006
+        fcPitch = math.clamp(fcPitch - input.Delta.Y * 0.006, -1.5, 1.5)
+    end
+end))
+
+track(RunService.RenderStepped:Connect(function(dt)
+    if State.fov then
+        cam().FieldOfView = State.fovVal
+    end
+
+    if State.freecam then
+        local mv = getMoveVector()
+        local rot = CFrame.fromOrientation(fcPitch, fcYaw, 0)
+        local vert = (flyUp and 1 or 0) - (flyDown and 1 or 0)
+        local move = rot.RightVector * mv.X + rot.LookVector * (-mv.Z) + Vector3.new(0, vert, 0)
+        fcPos += move * State.freecamSpeed * dt
+        cam().CFrame = CFrame.new(fcPos) * rot
+    end
+
+    if State.fly then
+        if not flyBV or not flyBV.Parent then startFly() end
+        if flyBV and flyBG then
+            local cf = cam().CFrame
+            local mv = getMoveVector()
+            local dir = cf.RightVector * mv.X + cf.LookVector * (-mv.Z)
+            local vert = (flyUp and 1 or 0) - (flyDown and 1 or 0)
+            flyBV.Velocity = dir * State.flySpeed + Vector3.new(0, vert * State.flySpeed, 0)
+            flyBG.CFrame = cf
+            local hum = getHum()
+            if hum and not hum.PlatformStand then hum.PlatformStand = true end
+        end
+    end
+end))
+
+-- เกิดใหม่แล้วบินต่อ / กันล้มต่อ / อัปเดตแคชเดินทะลุ
+track(LocalPlayer.CharacterAdded:Connect(function()
+    task.wait(0.6)
+    if State.fly then startFly() end
+    if State.antiRagdoll then applyAntiRagdoll(true) end
+    rebuildNoclipWatch()
+end))
+
+-- แตะที่ไหนก็วาร์ปไปที่นั่น
+local function tapTeleport(pos)
+    local root = getRoot()
+    if not root then return end
+    local ray = cam():ScreenPointToRay(pos.X, pos.Y)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {getChar()}
+    local res = Workspace:Raycast(ray.Origin, ray.Direction * 2000, params)
+    if res then
+        root.CFrame = CFrame.new(res.Position + Vector3.new(0, 3.5, 0))
+    end
+end
+track(UserInputService.TouchTap:Connect(function(positions, gpe)
+    if State.tapTP and not gpe and positions[1] then tapTeleport(positions[1]) end
+end))
+track(UserInputService.InputBegan:Connect(function(input, gpe)
+    if State.tapTP and not gpe and input.UserInputType == Enum.UserInputType.MouseButton1 then
+        tapTeleport(input.Position)
+    end
+end))
+
+-- ออโต้คลิก
+-- แก้บั๊ก: เดิมมี fallback ไปจำลองคลิกเมาส์ทั่วจอ (mouse1click / VirtualUser) เวลาไม่ได้ถือของ
+-- ซึ่งบนมือถือมันไปแย่งจุดสัมผัสจริงของนิ้วเรา ทำให้กดปุ่มอื่นไม่ติดขณะเปิดออโต้คลิกอยู่
+-- ตอนนี้ตัดส่วนนั้นออกทั้งหมด: จะตีให้ก็ต่อเมื่อถืออาวุธ/อุปกรณ์ (Tool) อยู่เท่านั้น
+-- ถ้าไม่ได้ถืออะไร จะไม่ทำอะไรเลย ไม่ไปยุ่งกับหน้าจอ นิ้วเรากดปุ่มอื่นได้ตามปกติ
+local function doClick()
+    local char = getChar()
+    local tool = char and char:FindFirstChildOfClass("Tool")
+    if tool then
+        pcall(function() tool:Activate() end)
+    end
+end
+
+-- ลูปออโต้คลิกแยกออกมาต่างหาก ไม่ผูกกับเฟรมเรตเหมือน Heartbeat (ซึ่งเคยล็อกไว้แค่ ~60 ครั้ง/วิ)
+-- ตอนนี้ปรับค่าได้สูงสุดตามที่ตั้งในช่องกรอก ความเร็วจริงยังขึ้นกับตัวเกม/อุปกรณ์ด้วย
+local autoClickToken = 0
+local function startAutoClickLoop()
+    autoClickToken += 1
+    local myToken = autoClickToken
+    task.spawn(function()
+        while State.autoClick and myToken == autoClickToken do
+            doClick()
+            task.wait(1 / math.max(State.cps, 1))
+        end
+    end)
+end
+
+-- ESP
+local ESPFolder = Instance.new("Folder")
+ESPFolder.Name = "MSH_ESP"
+ESPFolder.Parent = targetParent
+
+-- ชั้นวาดเส้น Tracer (2D) แยกจากเมนู วางไว้หลังเมนูเสมอ
+local TracerLayer = Instance.new("Frame")
+TracerLayer.Name = "TracerLayer"
+TracerLayer.BackgroundTransparency = 1
+TracerLayer.Size = UDim2.new(1, 0, 1, 0)
+TracerLayer.ZIndex = 5
+
+local espData = {}
+
+local function clearESP(plr)
+    local d = espData[plr]
+    if d then
+        pcall(function() d.hl:Destroy() end)
+        pcall(function() d.bb:Destroy() end)
+        pcall(function() d.tracer:Destroy() end)
+        espData[plr] = nil
+    end
+end
+
+-- ทีมเดียวกันไหม (บางเกมไม่มีระบบทีม จึงใช้ pcall กันพัง)
+local function sameTeam(plr)
+    local ok, res = pcall(function()
+        return plr.Team ~= nil and LocalPlayer.Team ~= nil and plr.Team == LocalPlayer.Team
+    end)
+    return ok and res
+end
+
+local function buildESP(plr)
+    clearESP(plr)
+    if plr == LocalPlayer or not State.esp then return end
+    if State.espTeamCheck and sameTeam(plr) then return end -- ซ่อนเพื่อนร่วมทีม
+    local char = plr.Character
+    local head = char and char:FindFirstChild("Head")
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not char or not head or not root then return end
+
+    local d = {friend = false}
+
+    local hl = Instance.new("Highlight")
+    hl.Adornee = char
+    hl.FillColor = COL.accent
+    hl.FillTransparency = State.espFill
+    hl.OutlineColor = Color3.new(1, 1, 1)
+    hl.OutlineTransparency = 0.2
+    hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    hl.Parent = ESPFolder
+
+    local bb = Instance.new("BillboardGui")
+    bb.Adornee = head
+    bb.Size = UDim2.new(0, 170, 0, 34)
+    bb.StudsOffset = Vector3.n
